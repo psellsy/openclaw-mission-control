@@ -204,37 +204,76 @@ function formatPromptWithSource(prompt: string, source: string | null): string {
 async function findAgentEventsModule(): Promise<{
   onAgentEvent: (listener: (evt: AgentEventPayload) => void) => () => void;
 } | null> {
-  const g = globalThis as Record<string, unknown>;
-  if (g.__openclawAgentEvents && typeof (g.__openclawAgentEvents as Record<string, unknown>).onAgentEvent === "function") {
-    return g.__openclawAgentEvents as { onAgentEvent: (listener: (evt: AgentEventPayload) => void) => () => void };
+  const g = globalThis as any;
+
+  // Method 1: globalThis unified event bus (if exposed)
+  if (g.__openclaw?.events?.on) {
+    console.log("[mission-control] Found event bus via globalThis.__openclaw.events");
+    return {
+      onAgentEvent: (listener) => g.__openclaw.events.on("agent", listener),
+    };
   }
 
-  const searchPaths = [
-    "/usr/local/lib/node_modules/openclaw/dist/infra/agent-events.js",
-    "/opt/homebrew/lib/node_modules/openclaw/dist/infra/agent-events.js",
-  ];
-
-  const mainPath = process.argv[1];
-  if (mainPath) {
-    const mainDir = path.dirname(mainPath);
-    searchPaths.unshift(path.join(mainDir, "infra", "agent-events.js"));
-    searchPaths.unshift(path.join(mainDir, "..", "dist", "infra", "agent-events.js"));
+  // Method 2: Legacy globalThis pattern
+  if (g.__openclawAgentEvents?.onAgentEvent) {
+    console.log("[mission-control] Found event bus via globalThis.__openclawAgentEvents");
+    return g.__openclawAgentEvents;
   }
 
-  const home = os.homedir();
-  if (home) {
-    searchPaths.push(path.join(home, ".npm-global", "lib", "node_modules", "openclaw", "dist", "infra", "agent-events.js"));
-  }
+  // Method 3: Dynamic import of OpenClaw's loader module (2026.2.x)
+  // The onAgentEvent function is module-scoped in the loader chunk.
+  // ESM modules are singletons by URL, so importing the same file gives us
+  // the same listener registry the gateway uses.
+  try {
+    const { createRequire } = await import("node:module");
+    const require = createRequire(import.meta.url);
+    const openclawMain = require.resolve("openclaw");
+    const distDir = path.dirname(openclawMain);
 
-  for (const searchPath of searchPaths) {
-    try {
-      if (fs.existsSync(searchPath)) {
-        const module = await import(`file://${searchPath}`);
-        if (typeof module.onAgentEvent === "function") return module;
+    // Find the loader chunk (e.g., loader-Ds3or8QX.js)
+    const distFiles = fs.readdirSync(distDir);
+    const loaderFile = distFiles.find(
+      (f: string) => f.startsWith("loader-") && f.endsWith(".js")
+    );
+
+    if (loaderFile) {
+      const loaderPath = path.join(distDir, loaderFile);
+      const loaderUrl = `file://${loaderPath}`;
+      const loader = await import(loaderUrl);
+
+      // The loader exports onAgentEvent under a minified name.
+      // Search exports for a function that matches the onAgentEvent signature
+      // (adds to a Set of listeners and returns an unsubscribe function).
+      let onAgentEventFn: ((listener: (evt: AgentEventPayload) => void) => () => void) | null = null;
+
+      for (const [key, val] of Object.entries(loader)) {
+        if (typeof val !== "function") continue;
+        // Test: call with a dummy listener, check if it returns a function (unsubscribe)
+        try {
+          const dummyListener = () => {};
+          const result = (val as any)(dummyListener);
+          if (typeof result === "function") {
+            // Verify by calling the unsubscribe
+            result();
+            // This looks like onAgentEvent — it accepted a listener and returned unsubscribe
+            onAgentEventFn = val as any;
+            console.log(`[mission-control] Found onAgentEvent as loader export "${key}"`);
+            break;
+          }
+        } catch {
+          // Not the right function, continue
+        }
       }
-    } catch {
-      // Continue
+
+      if (onAgentEventFn) {
+        return { onAgentEvent: onAgentEventFn };
+      }
+      console.log("[mission-control] Loader found but onAgentEvent export not identified");
+    } else {
+      console.log("[mission-control] No loader-*.js found in", distDir);
     }
+  } catch (err) {
+    console.log("[mission-control] Dynamic loader import failed:", err instanceof Error ? err.message : err);
   }
 
   return null;
@@ -245,6 +284,215 @@ const handler = async (event: HookEvent) => {
   if (!missionControlUrl) {
     const cfg = event.context.cfg as OpenClawConfig | undefined;
     missionControlUrl = resolveUrl(cfg);
+  }
+
+  // Force listener registration on first hook invocation
+  if (!listenerRegistered) {
+    if (!missionControlUrl) {
+      console.log("[mission-control] No URL configured, skipping listener registration");
+    } else {
+      try {
+        const agentEvents = await findAgentEventsModule();
+        if (!agentEvents) {
+          console.error("[mission-control] Could not find agent-events module");
+        } else {
+          agentEvents.onAgentEvent(async (evt: AgentEventPayload) => {
+            const sessionKey = evt.sessionKey;
+            if (!sessionKey) return;
+
+            // Lifecycle events
+            if (evt.stream === "lifecycle") {
+              const phase = evt.data?.phase as string | undefined;
+              if (!phase) return;
+
+              // Skip heartbeat runs — they shouldn't create tasks
+              const messageChannel = evt.data?.messageChannel as string | undefined;
+              if (messageChannel === "heartbeat") {
+                console.log("[mission-control] Skipping heartbeat lifecycle event");
+                return;
+              }
+
+              const info = sessionInfo.get(sessionKey);
+
+              if (phase === "start") {
+                let prompt: string | null = null;
+                let source: string | null = null;
+                let rawPrompt: string | null = null;
+
+                if (info) {
+                  const sessionFile = getSessionFilePath(info.agentId, info.sessionId);
+                  await new Promise(resolve => setTimeout(resolve, 100));
+                  rawPrompt = await getLastUserMessage(sessionFile);
+                  if (rawPrompt) {
+                    const extracted = extractCleanPrompt(rawPrompt);
+                    prompt = extracted.prompt;
+                    source = extracted.source;
+                    console.log("[mission-control] Raw prompt:", rawPrompt.slice(0, 100));
+                    console.log("[mission-control] Clean prompt:", prompt.slice(0, 100));
+                    console.log("[mission-control] Source:", source);
+                  }
+                }
+
+                const userChannels = ["telegram", "webchat", "whatsapp", "discord", "slack", "signal", "sms", "imessage", "nostr"];
+                const isUserChannel = (messageChannel && userChannels.includes(messageChannel)) || source !== null;
+
+                if (!isUserChannel && rawPrompt && (rawPrompt.startsWith("System:") || rawPrompt.startsWith("Read HEARTBEAT"))) {
+                  console.log("[mission-control] System follow-up run, linking to previous runId:", lastRealRunId.get(sessionKey));
+                  return;
+                }
+
+                if (messageChannel && !source) {
+                  source = messageChannel;
+                }
+
+                lastRealRunId.set(sessionKey, evt.runId);
+                console.log("[mission-control] Tracked real runId:", evt.runId, "for session:", sessionKey);
+
+                void postToMissionControl({
+                  runId: evt.runId,
+                  action: "start",
+                  sessionKey,
+                  timestamp: new Date(evt.ts).toISOString(),
+                  prompt,
+                  source,
+                  eventType: "lifecycle:start",
+                });
+              } else if (phase === "end") {
+                let response: string | null = null;
+                if (info) {
+                  const sessionFile = getSessionFilePath(info.agentId, info.sessionId);
+                  response = await getLastAssistantMessage(sessionFile);
+                  if (response) {
+                    const maxLen = 1000;
+                    if (response.length > maxLen) {
+                      response = response.slice(0, maxLen) + "...";
+                    }
+                    console.log("[mission-control] Captured response:", response.slice(0, 100));
+                  }
+                }
+
+                const endRunId = lastRealRunId.get(sessionKey) || evt.runId;
+                sessionInfo.delete(sessionKey);
+                void postToMissionControl({
+                  runId: endRunId,
+                  action: "end",
+                  sessionKey,
+                  timestamp: new Date(evt.ts).toISOString(),
+                  response,
+                  eventType: "lifecycle:end",
+                });
+              } else if (phase === "error") {
+                const errorRunId = lastRealRunId.get(sessionKey) || evt.runId;
+                sessionInfo.delete(sessionKey);
+                void postToMissionControl({
+                  runId: errorRunId,
+                  action: "error",
+                  sessionKey,
+                  timestamp: new Date(evt.ts).toISOString(),
+                  error: evt.data?.error as string | undefined,
+                  eventType: "lifecycle:error",
+                });
+              }
+              return;
+            }
+
+            if (evt.stream === "tool") {
+              const toolName = evt.data?.name as string | undefined;
+              const phase = evt.data?.phase as string | undefined;
+              const toolCallId = evt.data?.toolCallId as string | undefined;
+
+              const effectiveRunId = lastRealRunId.get(sessionKey) || evt.runId;
+
+              if (toolName && phase === "start") {
+                void postToMissionControl({
+                  runId: effectiveRunId,
+                  action: "progress",
+                  sessionKey,
+                  timestamp: new Date(evt.ts).toISOString(),
+                  message: `🔧 Using tool: ${toolName}`,
+                  eventType: "tool:start",
+                });
+
+                if (toolName === "write" && toolCallId) {
+                  const args = evt.data?.args as Record<string, unknown> | undefined;
+                  const filePath = (args?.file_path ?? args?.path) as string | undefined;
+                  const content = args?.content as string | undefined;
+
+                  if (filePath && content) {
+                    pendingWrites.set(toolCallId, { filePath, content, sessionKey });
+                    console.log(`[mission-control] Tracking write: ${toolCallId} -> ${filePath}`);
+                  }
+                }
+              }
+
+              if (toolName === "write" && phase === "result" && toolCallId) {
+                const isError = evt.data?.isError as boolean | undefined;
+                const pending = pendingWrites.get(toolCallId);
+
+                if (pending && !isError) {
+                  const { filePath, content } = pending;
+                  const fileName = path.basename(filePath);
+                  const ext = path.extname(filePath).toLowerCase();
+
+                  let docType = "text";
+                  if ([".md", ".markdown"].includes(ext)) docType = "markdown";
+                  else if ([".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".rs", ".java", ".c", ".cpp", ".h", ".css", ".html", ".json", ".yaml", ".yml", ".toml", ".sh", ".bash"].includes(ext)) docType = "code";
+                  else if ([".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico"].includes(ext)) docType = "image";
+                  else if ([".txt", ".log"].includes(ext)) docType = "note";
+
+                  const info = sessionInfo.get(pending.sessionKey);
+
+                  void postToMissionControl({
+                    runId: effectiveRunId,
+                    action: "document",
+                    sessionKey: pending.sessionKey,
+                    timestamp: new Date(evt.ts).toISOString(),
+                    agentId: info?.agentId,
+                    document: {
+                      title: fileName,
+                      content: content.length > 50000 ? content.slice(0, 50000) + "\n\n[Content truncated...]" : content,
+                      type: docType,
+                      path: filePath,
+                    },
+                    eventType: "tool:write",
+                  });
+
+                  console.log(`[mission-control] Document captured: ${fileName} (${docType})`);
+                }
+
+                pendingWrites.delete(toolCallId);
+              }
+            }
+
+            if (evt.stream === "assistant") {
+              const content = evt.data?.content as string | undefined;
+              const chunkType = evt.data?.type as string | undefined;
+
+              if (chunkType === "thinking_start") {
+                void postToMissionControl({
+                  runId: evt.runId,
+                  action: "progress",
+                  sessionKey,
+                  timestamp: new Date(evt.ts).toISOString(),
+                  message: "💭 Thinking...",
+                  eventType: "assistant:thinking",
+                });
+              }
+            }
+
+            if (!["lifecycle", "tool", "exec", "assistant"].includes(evt.stream)) {
+              console.log(`[mission-control] Unhandled stream: ${evt.stream}`, JSON.stringify(evt.data).slice(0, 200));
+            }
+          });
+
+          listenerRegistered = true;
+          console.log("[mission-control] Registered event listener (forced)");
+          console.log("[mission-control] URL:", missionControlUrl);
+        }
+      } catch (err) {
+        console.error("[mission-control] Failed:", err instanceof Error ? err.message : err);
+      }
+    }
   }
 
   console.log(`[mission-control] Event: ${event.type}:${event.action} session=${event.sessionKey}`);
@@ -261,8 +509,8 @@ const handler = async (event: HookEvent) => {
     return;
   }
 
-  // Register listener on gateway startup
-  if (event.type === "gateway" && event.action === "startup") {
+  // Register listener on gateway startup OR immediately if gateway already running
+  if ((event.type === "gateway" && event.action === "startup") || event.type === "agent") {
     if (listenerRegistered) return;
 
     if (!missionControlUrl) {
